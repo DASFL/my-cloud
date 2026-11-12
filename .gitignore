@@ -1,0 +1,29 @@
+# Локальные настройки и секреты
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node.js и сборка фронтенда
+node_modules/
+dist/
+
+# Локальные базы, дампы и файлы пользователей
+*.sqlite3
+*.sqlite3-*
+*.db
+*.dump
+pgdata/
+media/
+uploads/
+storage/
+private_storage/
+
+# Системные файлы
+.DS_Store
