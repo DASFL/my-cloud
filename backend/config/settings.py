@@ -1,4 +1,8 @@
 import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FILE_STORAGE_ROOT = PROJECT_ROOT / (os.environ.get("FILE_STORAGE_ROOT") or "private_storage")
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
 ALLOWED_HOSTS = [
@@ -18,6 +22,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "rest_framework",
     "accounts",
+    "files",
 ]
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
