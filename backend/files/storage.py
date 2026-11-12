@@ -2,8 +2,10 @@ import logging
 import os
 import stat
 from contextlib import ExitStack, contextmanager
+from secrets import token_urlsafe
 
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
+from psycopg.errors import UniqueViolation
 
 from .models import StoredFile
 
@@ -94,3 +96,26 @@ def delete_stored_file(owner, file_id):
         else:
             logger.error("Не удалось подтвердить удаление записи файла %s.", file_id)
         raise
+
+
+def get_share_token(owned_files, file_id):
+    with transaction.atomic():
+        stored = owned_files.select_for_update().get(pk=file_id)
+        if stored.share_token:
+            return stored.share_token
+
+        for _ in range(3):
+            stored.share_token = token_urlsafe(32)
+            try:
+                with transaction.atomic():
+                    stored.save(update_fields=["share_token"])
+                return stored.share_token
+            except IntegrityError as error:
+                cause = error.__cause__
+                if (
+                    not isinstance(cause, UniqueViolation)
+                    or cause.diag.constraint_name != "files_storedfile_share_token_key"
+                ):
+                    raise
+
+        raise DatabaseError("Не удалось создать уникальный токен.")

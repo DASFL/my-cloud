@@ -1,9 +1,11 @@
+import logging
 from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from secrets import token_urlsafe
 from tempfile import TemporaryDirectory
 from unittest.mock import PropertyMock, patch
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from django.conf import settings
@@ -15,6 +17,8 @@ from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.test import APIClient, APITestCase
+
+from config.log_filters import RedactShareTokens
 
 from .models import StoredFile
 
@@ -90,6 +94,13 @@ class FileAPITests(APITestCase):
         return client.delete(
             reverse("file-detail", args=[file_id]), data=data, format="json", **self.csrf_header(client)
         )
+
+    def share(self, file_id, client=None, **headers):
+        client = self.client if client is None else client
+        with self.settings(PUBLIC_APP_ORIGIN="https://cloud.example.com/"):
+            return client.post(
+                reverse("file-share", args=[file_id]), **self.csrf_header(client), **headers
+            )
 
     def test_upload_saves_bytes_and_public_metadata(self):
         content = b"\x00report\xff"
@@ -860,3 +871,138 @@ class FileAPITests(APITestCase):
 
         self.assertFalse(StoredFile.objects.filter(pk=stored.pk).exists())
         self.assertEqual(path.read_bytes(), b"report contents")
+
+    def test_owner_gets_stable_configured_url_with_opaque_token(self):
+        stored = self.edit_target()
+        self.assertEqual(self.patch_file(stored.pk, {"original_name": "Private Report.pdf"}).status_code, 200)
+        response = self.share(stored.pk, HTTP_HOST="localhost")
+        self.assertEqual(response.status_code, 200)
+        stored.refresh_from_db()
+        self.assertRegex(stored.share_token, r"\A[A-Za-z0-9_-]{43}\Z")
+        url = response.json()["url"]
+        self.assertEqual(url, f"https://cloud.example.com/api/shared/{stored.share_token}/download/")
+        for value in (stored.owner.username, stored.owner.full_name, stored.original_name, stored.relative_path):
+            self.assertNotIn(value, unquote(url))
+        self.assertEqual(self.share(stored.pk).json(), response.json())
+        listed = self.client.get(self.url)
+        self.assertEqual(listed.status_code, 200)
+        self.assertNotIn("share_token", listed.json()[0])
+        self.assertNotIn(stored.share_token, listed.content.decode())
+
+    def test_token_collision_is_retried_without_changing_existing_link(self):
+        first = self.edit_target()
+        second = self.edit_target()
+        self.assertEqual(self.share(first.pk).status_code, 200)
+        first.refresh_from_db()
+        fresh_token = token_urlsafe(32)
+        with patch("files.storage.token_urlsafe", side_effect=[first.share_token, fresh_token]) as generate:
+            response = self.share(second.pk)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generate.call_count, 2)
+        second.refresh_from_db()
+        self.assertEqual(second.share_token, fresh_token)
+        self.assertNotEqual(first.share_token, second.share_token)
+        self.assertEqual(StoredFile.objects.get(pk=first.pk).share_token, first.share_token)
+
+    def test_share_requires_owner_session_and_csrf(self):
+        stored = self.edit_target()
+        guest = APIClient(enforce_csrf_checks=True)
+        guest.get(reverse("csrf"))
+        self.assertEqual(self.share(stored.pk, client=guest).status_code, 403)
+        self.assertEqual(self.client.post(reverse("file-share", args=[stored.pk])).status_code, 403)
+        other = self.signed_in_client(self.other)
+        foreign = self.share(stored.pk, client=other)
+        missing = self.share(uuid4(), client=other)
+        self.assertEqual(foreign.status_code, 404)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(foreign.json(), missing.json())
+        stored.refresh_from_db()
+        self.assertIsNone(stored.share_token)
+
+    def test_invalid_public_origin_does_not_create_token_or_use_request_host(self):
+        stored = self.edit_target()
+        url = reverse("file-share", args=[stored.pk])
+        for origin in ("", "https://cloud.example.com/path", "https://cloud.example.com:99999"):
+            with self.settings(PUBLIC_APP_ORIGIN=origin):
+                response = self.client.post(url, HTTP_HOST="localhost", **self.csrf_header(self.client))
+                self.assertEqual(response.status_code, 503)
+        stored.refresh_from_db()
+        self.assertIsNone(stored.share_token)
+
+    def test_guest_streams_binary_and_empty_files_with_original_name(self):
+        guest = APIClient(enforce_csrf_checks=True)
+        name = 'Отчёт № 12 "версия".unknown-step12'
+        for content in (b"", bytes(range(256)) * 40):
+            uploaded = self.upload(file=SimpleUploadedFile(name, content))
+            self.assertEqual(uploaded.status_code, 201)
+            file_id = uploaded.json()["id"]
+            share = self.share(file_id)
+            self.assertEqual(share.status_code, 200)
+            path = urlsplit(share.json()["url"]).path
+            response = guest.get(path, HTTP_ACCEPT="application/octet-stream")
+
+            self.assertEqual(self.read_download(response), content)
+            self.assertEqual(response["Content-Type"], "application/octet-stream")
+            disposition, encoded = response["Content-Disposition"].split("; filename*=utf-8''")
+            self.assertEqual(disposition, "attachment")
+            self.assertEqual(unquote(encoded), name)
+            self.assertFalse(guest.cookies)
+            stored = StoredFile.objects.get(pk=file_id)
+            self.assertIsNotNone(stored.last_downloaded_at)
+            for value in (stored.share_token, stored.owner.storage_relpath, stored.owner.username):
+                self.assertNotIn(value, str(response.headers))
+
+    def test_invalid_unknown_missing_and_deleted_links_return_same_404(self):
+        guest = APIClient(enforce_csrf_checks=True)
+        invalid = guest.get(reverse("shared-download", args=["invalid!"]))
+        unknown = guest.get(reverse("shared-download", args=[token_urlsafe(32)]))
+        self.assertEqual(invalid.status_code, 404)
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(invalid.json(), unknown.json())
+        stored = self.edit_target()
+        path = urlsplit(self.share(stored.pk).json()["url"]).path
+        stored.storage_path.unlink()
+        missing = guest.get(path)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json(), unknown.json())
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+        self.assertEqual(self.delete_file(stored.pk).status_code, 204)
+        deleted = guest.get(path)
+        self.assertEqual(deleted.status_code, 404)
+        self.assertEqual(deleted.json(), unknown.json())
+
+    def test_shared_download_rejects_symlink_outside_storage(self):
+        stored = self.edit_target()
+        shared_path = urlsplit(self.share(stored.pk).json()["url"]).path
+        path = stored.storage_path
+        outside = self.root.parent / "outside.txt"
+        outside.write_bytes(b"outside storage")
+        path.unlink()
+        path.symlink_to(outside)
+
+        response = APIClient().get(shared_path)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(str(outside), response.content.decode())
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_shared_paths_are_redacted_in_console_logs(self):
+        console = next(
+            handler for handler in logging.getLogger().handlers
+            if any(isinstance(item, RedactShareTokens) for item in handler.filters)
+        )
+        path = reverse("shared-download", args=[token_urlsafe(32)])
+        stream = StringIO()
+        previous = console.setStream(stream)
+        try:
+            self.assertEqual(APIClient().get(path).status_code, 404)
+            logging.getLogger("django.server").warning('"GET %s HTTP/1.1" 200 10', path)
+        finally:
+            console.setStream(previous)
+        logs = stream.getvalue()
+        self.assertNotIn(path.split("/")[3], logs)
+        self.assertIn("Not Found: /api/shared/[redacted]/download/", logs)
+        self.assertIn('"GET /api/shared/[redacted]/download/ HTTP/1.1" 200', logs)

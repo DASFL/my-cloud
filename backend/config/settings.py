@@ -4,6 +4,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FILE_STORAGE_ROOT = PROJECT_ROOT / (os.environ.get("FILE_STORAGE_ROOT") or "private_storage")
 FILE_UPLOAD_MAX_BYTES = int(os.environ.get("FILE_UPLOAD_MAX_BYTES", "26214400"))
+PUBLIC_APP_ORIGIN = os.environ.get("PUBLIC_APP_ORIGIN", "")
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
 ALLOWED_HOSTS = [
@@ -66,8 +67,11 @@ LOGGING = {
         },
     },
     "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "console"},
+        "console": {
+            "class": "logging.StreamHandler", "formatter": "console", "filters": ["share_tokens"],
+        },
     },
+    "filters": {"share_tokens": {"()": "config.log_filters.RedactShareTokens"}},
     "root": {"handlers": ["console"], "level": LOG_LEVEL},
     "loggers": {
         "django": {"handlers": [], "level": LOG_LEVEL, "propagate": True},
