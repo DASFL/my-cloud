@@ -7,6 +7,18 @@ from rest_framework import serializers
 from .models import User
 
 
+class LoginSerializer(serializers.Serializer):
+    username = serializers.CharField(trim_whitespace=False)
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+
+class SessionUserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ("id", "username", "full_name", "email", "is_staff")
+        read_only_fields = fields
+
+
 class RegistrationSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, trim_whitespace=False)
 

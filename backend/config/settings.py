@@ -9,10 +9,13 @@ ALLOWED_HOSTS = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 CSRF_FAILURE_VIEW = "config.views.csrf_failure"
+SESSION_COOKIE_SECURE = os.environ.get("DJANGO_SECURE_COOKIES", "0") == "1"
+CSRF_COOKIE_SECURE = SESSION_COOKIE_SECURE
 
 INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.contenttypes",
+    "django.contrib.sessions",
     "rest_framework",
     "accounts",
 ]
@@ -29,8 +32,10 @@ AUTH_PASSWORD_VALIDATORS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
 ]
 
 DATABASES = {

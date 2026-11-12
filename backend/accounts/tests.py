@@ -1,6 +1,4 @@
 from django.conf import settings
-from django.http import HttpRequest
-from django.middleware.csrf import get_token
 from django.urls import reverse
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient, APITestCase
@@ -19,9 +17,8 @@ class RegistrationTests(APITestCase):
             "password": "Example7!",
         }
         self.client = APIClient(enforce_csrf_checks=True)
-        request = HttpRequest()
-        self.csrf_token = get_token(request)
-        self.client.cookies[settings.CSRF_COOKIE_NAME] = request.META["CSRF_COOKIE"]
+        response = self.client.get(reverse("csrf"))
+        self.csrf_token = response.json()["csrf_token"]
 
     def register(self, payload, **headers):
         return self.client.post(
