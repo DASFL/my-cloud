@@ -1,18 +1,19 @@
 import logging
 
 from django.db import DatabaseError
+from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
-from rest_framework.parsers import MultiPartParser
+from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import StoredFile
-from .serializers import FileUploadSerializer, StoredFileSerializer
+from .serializers import FileUploadSerializer, StoredFileSerializer, StoredFileUpdateSerializer
 from .storage import save_upload
 
 logger = logging.getLogger(__name__)
@@ -43,3 +44,18 @@ class FileListView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         return Response(StoredFileSerializer(stored).data, status=status.HTTP_201_CREATED)
+
+
+@method_decorator(never_cache, name="dispatch")
+class FileDetailView(APIView):
+    authentication_classes = [SessionAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+    renderer_classes = [JSONRenderer]
+
+    def patch(self, request, file_id):
+        stored = get_object_or_404(StoredFile, pk=file_id, owner=request.user)
+        serializer = StoredFileUpdateSerializer(stored, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(StoredFileSerializer(stored).data)

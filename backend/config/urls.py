@@ -1,7 +1,7 @@
 from django.urls import path
 
 from accounts.views import CsrfCookieView, CurrentUserView, LoginView, LogoutView, RegistrationView
-from files.views import FileListView
+from files.views import FileDetailView, FileListView
 
 from .views import health
 
@@ -13,4 +13,5 @@ urlpatterns = [
     path("api/auth/me/", CurrentUserView.as_view(), name="me"),
     path("api/auth/logout/", LogoutView.as_view(), name="logout"),
     path("api/files/", FileListView.as_view(), name="files"),
+    path("api/files/<uuid:file_id>/", FileDetailView.as_view(), name="file-detail"),
 ]

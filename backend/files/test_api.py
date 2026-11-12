@@ -61,6 +61,17 @@ class FileAPITests(APITestCase):
         self.assertFalse(StoredFile.objects.exists())
         self.assertEqual(self.saved_paths(), [])
 
+    def edit_target(self):
+        response = self.upload(comment="Исходный комментарий")
+        self.assertEqual(response.status_code, 201)
+        return StoredFile.objects.get(pk=response.json()["id"])
+
+    def patch_file(self, file_id, data, client=None):
+        client = self.client if client is None else client
+        return client.patch(
+            reverse("file-detail", args=[file_id]), data, format="json", **self.csrf_header(client)
+        )
+
     def test_upload_saves_bytes_and_public_metadata(self):
         content = b"\x00report\xff"
         response = self.upload(content, comment="Отчёт")
@@ -277,3 +288,180 @@ class FileAPITests(APITestCase):
         self.assertEqual(response.status_code, 500)
         self.assertFalse(StoredFile.objects.exists())
         self.assertEqual(path.read_bytes(), b"existing content")
+
+    def test_rename_updates_only_display_name(self):
+        stored = self.edit_target()
+        stored.last_downloaded_at = timezone.now()
+        stored.share_token = token_urlsafe(32)
+        stored.save(update_fields=["last_downloaded_at", "share_token"])
+        path = stored.storage_path
+        content = path.read_bytes()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+        previous_metadata = self.client.get(self.url).json()[0]
+        name = "Отчёт за ноябрь 2026.pdf"
+
+        response = self.patch_file(stored.pk, {"original_name": name})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {**previous_metadata, "original_name": name})
+        self.assertEqual(StoredFile.objects.values().get(pk=stored.pk), {**before, "original_name": name})
+        self.assertEqual(StoredFile.objects.count(), 1)
+        stored.refresh_from_db()
+        self.assertEqual(stored.storage_path, path)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.saved_paths(), [self.root / stored.relative_path])
+
+    def test_patch_updates_comment_without_renaming(self):
+        stored = self.edit_target()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+
+        response = self.patch_file(stored.pk, {"comment": "Новый комментарий"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["comment"], "Новый комментарий")
+        self.assertEqual(
+            StoredFile.objects.values().get(pk=stored.pk), {**before, "comment": "Новый комментарий"}
+        )
+
+    def test_patch_updates_both_fields(self):
+        stored = self.edit_target()
+        changes = {"original_name": "Отчёт.xlsx", "comment": "Новая версия"}
+
+        response = self.patch_file(stored.pk, changes)
+
+        self.assertEqual(response.status_code, 200)
+        stored.refresh_from_db()
+        self.assertEqual(stored.original_name, changes["original_name"])
+        self.assertEqual(stored.comment, changes["comment"])
+        self.assertEqual(self.client.get(self.url).json(), [response.json()])
+
+    def test_patch_clears_comment(self):
+        stored = self.edit_target()
+
+        response = self.patch_file(stored.pk, {"comment": ""})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["comment"], "")
+        stored.refresh_from_db()
+        self.assertEqual(stored.comment, "")
+
+    def test_empty_patch_leaves_metadata_unchanged(self):
+        stored = self.edit_target()
+        before = self.client.get(self.url).json()[0]
+
+        response = self.patch_file(stored.pk, {})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), before)
+        self.assertEqual(self.client.get(self.url).json(), [before])
+
+    def test_patch_rejects_blank_names_and_dot_segments(self):
+        stored = self.edit_target()
+        for name in ("", "   ", ".", ".."):
+            with self.subTest(name=name):
+                response = self.patch_file(stored.pk, {"original_name": name})
+                self.assertEqual(response.status_code, 400)
+                self.assertTrue(response.json()["original_name"])
+
+    def test_patch_rejects_path_separators_and_control_characters(self):
+        stored = self.edit_target()
+        for name in (
+            "../report.pdf", "dir\\report.pdf", "/tmp/report.pdf",
+            "a\nb.pdf", "a\x00b.pdf", "a\x7fb.pdf", "a\u202eb.pdf",
+        ):
+            with self.subTest(name=name):
+                response = self.patch_file(stored.pk, {"original_name": name})
+                self.assertEqual(response.status_code, 400)
+                self.assertTrue(response.json()["original_name"])
+
+    def test_patch_enforces_model_name_length(self):
+        stored = self.edit_target()
+        limit = StoredFile._meta.get_field("original_name").max_length
+        valid_name = "я" * limit
+
+        self.assertEqual(self.patch_file(stored.pk, {"original_name": valid_name}).status_code, 200)
+        response = self.patch_file(stored.pk, {"original_name": valid_name + "я"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.json()["original_name"])
+        stored.refresh_from_db()
+        self.assertEqual(stored.original_name, valid_name)
+
+    def test_patch_requires_strings_for_name_and_comment(self):
+        stored = self.edit_target()
+        for field in ("original_name", "comment"):
+            for value in (None, 12, True, [], {}):
+                with self.subTest(field=field, value=value):
+                    response = self.patch_file(stored.pk, {field: value})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertTrue(response.json()[field])
+
+    def test_patch_rejects_system_fields(self):
+        stored = self.edit_target()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+        fields = {
+            "id": str(uuid4()), "owner": self.other.pk, "owner_id": self.other.pk,
+            "relative_path": "elsewhere", "size_bytes": 1, "created_at": None,
+            "last_downloaded_at": None, "share_token": "provided-token", "extra": "unsupported",
+        }
+
+        response = self.patch_file(stored.pk, {"comment": "Изменённый", **fields})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(set(response.json()), set(fields))
+        self.assertEqual(StoredFile.objects.values().get(pk=stored.pk), before)
+
+    def test_patch_hides_foreign_files_even_from_staff(self):
+        stored = self.edit_target()
+        other_client = self.signed_in_client(self.other)
+        response = self.patch_file(stored.pk, {"comment": "Чужой"}, client=other_client)
+        self.assertEqual(response.status_code, 404)
+
+        get_user_model().objects.filter(pk=self.other.pk).update(is_staff=True)
+        staff_response = self.patch_file(stored.pk, {"comment": "Чужой"}, client=other_client)
+        missing = self.patch_file(uuid4(), {"comment": "Чужой"}, client=other_client)
+        self.assertEqual(staff_response.status_code, 404)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(response.json(), missing.json())
+        self.assertEqual(staff_response.json(), missing.json())
+        stored.refresh_from_db()
+        self.assertEqual(stored.comment, "Исходный комментарий")
+
+    def test_guest_cannot_patch_even_with_csrf_cookie(self):
+        stored = self.edit_target()
+        guest = APIClient(enforce_csrf_checks=True)
+        guest.get(reverse("csrf"))
+
+        response = self.patch_file(stored.pk, {"comment": "Чужой"}, client=guest)
+
+        self.assertEqual(response.status_code, 403)
+        stored.refresh_from_db()
+        self.assertEqual(stored.comment, "Исходный комментарий")
+
+    def test_patch_requires_csrf_token(self):
+        stored = self.edit_target()
+        response = self.client.patch(
+            reverse("file-detail", args=[stored.pk]), {"comment": "Изменённый"}, format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(response.json()["detail"])
+        stored.refresh_from_db()
+        self.assertEqual(stored.comment, "Исходный комментарий")
+
+    def test_patch_returns_json_for_missing_file(self):
+        response = self.patch_file(uuid4(), {"comment": "Отсутствует"})
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(response.json()["detail"])
+
+    def test_invalid_patch_never_applies_the_other_field(self):
+        stored = self.edit_target()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+        for changes in (
+            {"original_name": "../report.pdf", "comment": "Допустимый комментарий"},
+            {"original_name": "Допустимое имя.pdf", "comment": ["Неверный тип"]},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.patch_file(stored.pk, changes).status_code, 400)
+                self.assertEqual(StoredFile.objects.values().get(pk=stored.pk), before)
