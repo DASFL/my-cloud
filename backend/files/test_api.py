@@ -85,6 +85,12 @@ class FileAPITests(APITestCase):
         self.assertTrue(response.closed)
         return content
 
+    def delete_file(self, file_id, client=None, data=None):
+        client = self.client if client is None else client
+        return client.delete(
+            reverse("file-detail", args=[file_id]), data=data, format="json", **self.csrf_header(client)
+        )
+
     def test_upload_saves_bytes_and_public_metadata(self):
         content = b"\x00report\xff"
         response = self.upload(content, comment="Отчёт")
@@ -667,3 +673,190 @@ class FileAPITests(APITestCase):
         self.assertEqual(response.json(), {"detail": "Не удалось подготовить скачивание."})
         stored.refresh_from_db()
         self.assertIsNone(stored.last_downloaded_at)
+
+    def test_delete_removes_only_target_record_and_file(self):
+        target = self.edit_target()
+        neighbor = self.edit_target()
+        other_upload = self.upload(b"other owner", client=self.signed_in_client(self.other))
+        self.assertEqual(other_upload.status_code, 201)
+        foreign = StoredFile.objects.get(pk=other_upload.json()["id"])
+        target_path = target.storage_path
+        neighbor_path = neighbor.storage_path
+        foreign_path = foreign.storage_path
+
+        response = self.delete_file(target.pk)
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.content, b"")
+        self.assertFalse(StoredFile.objects.filter(pk=target.pk).exists())
+        self.assertFalse(target_path.exists())
+        self.assertTrue(self.root.is_dir())
+        self.assertEqual(neighbor_path.read_bytes(), b"report contents")
+        self.assertEqual(foreign_path.read_bytes(), b"other owner")
+        self.assertEqual(set(StoredFile.objects.values_list("pk", flat=True)), {neighbor.pk, foreign.pk})
+        self.assertEqual([item["id"] for item in self.client.get(self.url).json()], [str(neighbor.pk)])
+        self.assertEqual(self.delete_file(target.pk).status_code, 404)
+
+    def test_delete_returns_404_for_missing_and_invalid_uuid(self):
+        missing = self.delete_file(uuid4())
+        invalid = self.client.delete("/api/files/not-a-uuid/", **self.csrf_header(self.client))
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertTrue(missing.json()["detail"])
+        self.assertEqual(invalid.status_code, 404)
+
+    def test_delete_hides_foreign_files_even_from_staff(self):
+        stored = self.edit_target()
+        other_client = self.signed_in_client(self.other)
+        missing = self.delete_file(uuid4(), client=other_client)
+        for is_staff in (False, True):
+            with self.subTest(is_staff=is_staff):
+                get_user_model().objects.filter(pk=self.other.pk).update(is_staff=is_staff)
+                response = self.delete_file(stored.pk, client=other_client)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json(), missing.json())
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(stored.storage_path.read_bytes(), b"report contents")
+
+    def test_guest_cannot_delete_even_with_csrf_cookie(self):
+        stored = self.edit_target()
+        guest = APIClient(enforce_csrf_checks=True)
+        guest.get(reverse("csrf"))
+
+        self.assertEqual(self.delete_file(stored.pk, client=guest).status_code, 403)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertTrue(stored.storage_path.is_file())
+
+    def test_delete_requires_valid_csrf(self):
+        stored = self.edit_target()
+        url = reverse("file-detail", args=[stored.pk])
+        for headers in ({}, {**self.csrf_header(self.client), "HTTP_ORIGIN": "https://example.invalid"}):
+            self.assertEqual(self.client.delete(url, **headers).status_code, 403)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertTrue(stored.storage_path.is_file())
+
+    def test_delete_rejects_client_supplied_path(self):
+        stored = self.edit_target()
+        neighbor = self.edit_target()
+        response = self.delete_file(stored.pk, data={"relative_path": neighbor.relative_path})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(StoredFile.objects.count(), 2)
+        self.assertTrue(stored.storage_path.is_file())
+        self.assertTrue(neighbor.storage_path.is_file())
+
+    def test_database_delete_failure_preserves_record_and_file(self):
+        stored = self.edit_target()
+        with (
+            patch.object(StoredFile, "delete", side_effect=DatabaseError("test failure")),
+            self.assertLogs("files.storage", level="ERROR"),
+        ):
+            response = self.delete_file(stored.pk)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(stored.storage_path.read_bytes(), b"report contents")
+
+    def test_database_commit_failure_preserves_file_after_delete_sql(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        original_commit = connection.savepoint_commit
+
+        def fail_once(savepoint):
+            self.assertFalse(StoredFile.objects.filter(pk=stored.pk).exists())
+            self.assertTrue(path.is_file())
+            commit.side_effect = original_commit
+            raise DatabaseError("test failure when finishing transaction")
+
+        with patch.object(connection, "savepoint_commit", side_effect=fail_once) as commit:
+            response = self.delete_file(stored.pk)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(path.read_bytes(), b"report contents")
+
+    def test_inaccessible_directory_preserves_record_and_file(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        with patch("files.storage._open_owner_directory", side_effect=PermissionError(str(path))):
+            response = self.delete_file(stored.pk)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(path.read_bytes(), b"report contents")
+
+    def test_unlink_failure_after_commit_reports_orphan_without_leaking_paths(self):
+        stored = self.edit_target()
+        token = token_urlsafe(32)
+        StoredFile.objects.filter(pk=stored.pk).update(share_token=token)
+        path = stored.storage_path
+        with (
+            patch("files.storage.os.unlink", side_effect=PermissionError(str(path))),
+            self.assertLogs("files.storage", level="ERROR") as logs,
+        ):
+            response = self.delete_file(stored.pk)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"detail": "Не удалось удалить файл."})
+        self.assertFalse(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(path.read_bytes(), b"report contents")
+        self.assertIn(str(stored.pk), logs.output[0])
+        for value in (str(path), stored.relative_path, token):
+            self.assertNotIn(value, response.content.decode())
+            self.assertNotIn(value, "\n".join(logs.output))
+
+    def test_delete_rejects_symlink_outside_storage(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        external_file = outside / path.name
+        external_file.write_bytes(b"outside storage")
+        path.unlink()
+        path.symlink_to(external_file)
+        self.assertEqual(self.delete_file(stored.pk).status_code, 500)
+        self.assertTrue(path.is_symlink())
+
+        path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.delete_file(stored.pk).status_code, 500)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(external_file.read_bytes(), b"outside storage")
+
+    def test_delete_rejects_path_from_another_owner_directory(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        foreign_path = self.root / self.other.storage_relpath / stored.pk.hex
+        foreign_path.parent.mkdir()
+        foreign_path.write_bytes(b"outside owner directory")
+        StoredFile.objects.filter(pk=stored.pk).update(
+            relative_path=f"{self.other.storage_relpath}/{stored.pk.hex}"
+        )
+
+        self.assertEqual(self.delete_file(stored.pk).status_code, 500)
+        self.assertTrue(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(path.read_bytes(), b"report contents")
+        self.assertEqual(foreign_path.read_bytes(), b"outside owner directory")
+
+    def test_delete_succeeds_when_physical_file_is_already_missing(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        path.unlink()
+        path.parent.rmdir()
+
+        response = self.delete_file(stored.pk)
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(self.client.get(self.url).json(), [])
+        self.assertTrue(self.root.is_dir())
+
+    def test_deleting_user_cascades_metadata_only(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+
+        self.owner.delete()
+
+        self.assertFalse(StoredFile.objects.filter(pk=stored.pk).exists())
+        self.assertEqual(path.read_bytes(), b"report contents")

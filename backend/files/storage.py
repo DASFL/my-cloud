@@ -1,9 +1,9 @@
 import logging
 import os
 import stat
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 
-from django.db import transaction
+from django.db import DatabaseError, transaction
 
 from .models import StoredFile
 
@@ -38,15 +38,20 @@ def save_upload(owner, uploaded_file, comment):
     return stored
 
 
-def open_download(stored):
-    path = stored.storage_path
+@contextmanager
+def _open_owner_directory(path):
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     with ExitStack() as directories:
         root_fd = os.open(path.parent.parent, directory_flags)
         directories.callback(os.close, root_fd)
         owner_fd = os.open(path.parent.name, directory_flags, dir_fd=root_fd)
         directories.callback(os.close, owner_fd)
+        yield owner_fd
 
+
+def open_download(stored):
+    path = stored.storage_path
+    with _open_owner_directory(path) as owner_fd:
         def open_in_owner_directory(name, flags):
             return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=owner_fd)
 
@@ -58,3 +63,34 @@ def open_download(stored):
             source.close()
             raise
         return source
+
+
+def delete_stored_file(owner, file_id):
+    committed = False
+    try:
+        with ExitStack() as directories:
+            with transaction.atomic(durable=True):
+                stored = StoredFile.objects.select_for_update().get(owner=owner, pk=file_id)
+                path = stored.storage_path
+                try:
+                    owner_fd = directories.enter_context(_open_owner_directory(path))
+                    mode = os.stat(path.name, dir_fd=owner_fd, follow_symlinks=False).st_mode
+                except FileNotFoundError:
+                    owner_fd = None
+                else:
+                    if not stat.S_ISREG(mode):
+                        raise ValueError("Удалять можно только обычные файлы.")
+                stored.delete()
+
+            committed = True
+            if owner_fd is not None:
+                try:
+                    os.unlink(path.name, dir_fd=owner_fd)
+                except FileNotFoundError:
+                    pass
+    except (DatabaseError, OSError, ValueError, RuntimeError):
+        if committed:
+            logger.error("Запись файла %s удалена, но очистка хранилища завершилась ошибкой.", file_id)
+        else:
+            logger.error("Не удалось подтвердить удаление записи файла %s.", file_id)
+        raise

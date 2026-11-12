@@ -18,7 +18,7 @@ from rest_framework.views import APIView
 
 from .models import StoredFile
 from .serializers import FileUploadSerializer, StoredFileSerializer, StoredFileUpdateSerializer
-from .storage import open_download, save_upload
+from .storage import delete_stored_file, open_download, save_upload
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,24 @@ class FileDetailView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(StoredFileSerializer(stored).data)
+
+    def delete(self, request, file_id):
+        if request.data:
+            return Response(
+                {"detail": "DELETE не принимает тело запроса."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            delete_stored_file(request.user, file_id)
+        except StoredFile.DoesNotExist:
+            raise NotFound("Файл не найден.") from None
+        except (DatabaseError, OSError, ValueError, RuntimeError):
+            return Response(
+                {"detail": "Не удалось удалить файл."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @method_decorator(never_cache, name="dispatch")
