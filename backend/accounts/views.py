@@ -1,10 +1,8 @@
 from django.contrib.auth import authenticate, login, logout
-from django.http import JsonResponse
 from django.middleware.csrf import get_token
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
-from django.views.decorators.http import require_safe
 from rest_framework import status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.generics import CreateAPIView
@@ -16,10 +14,15 @@ from rest_framework.views import APIView
 from .serializers import LoginSerializer, RegistrationSerializer, SessionUserSerializer
 
 
-@never_cache
-@require_safe
-def csrf_cookie(request):
-    return JsonResponse({"csrf_token": get_token(request)})
+@method_decorator(never_cache, name="dispatch")
+class CsrfCookieView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    renderer_classes = [JSONRenderer]
+    http_method_names = ["get", "head"]
+
+    def get(self, request):
+        return Response({"csrf_token": get_token(request)})
 
 
 @method_decorator(csrf_protect, name="dispatch")
