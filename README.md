@@ -2,7 +2,7 @@
 
 My Cloud — дипломный проект по курсу «Fullstack-разработчик на Python». Это небольшое облачное хранилище, где пользователь сможет загружать файлы, скачивать их и делиться ссылками.
 
-Сейчас в проекте есть каркас Django, проверка доступности PostgreSQL и главная страница React с заглушкой «My Cloud — в разработке».
+Сейчас в проекте есть каркас Django, модель пользователя, проверка доступности PostgreSQL и главная страница React с заглушкой «My Cloud — в разработке».
 
 ## Что планируется сделать
 
@@ -33,6 +33,13 @@ createuser --pwprompt my_cloud
 createdb --owner=my_cloud my_cloud
 ```
 
+Если в этой рабочей папке уже настроен локальный экземпляр в `pgdata/`, после остановки запустите его из корня проекта:
+
+```sh
+pgdata/Postgres.app/Contents/Versions/17/bin/pg_ctl -D pgdata/data -l pgdata/postgres.log \
+  -o "-h localhost -p 5432 -k '$PWD/pgdata/socket'" -w start
+```
+
 ### Django
 
 Из корня проекта подготовьте окружение и скопируйте шаблон настроек при первом запуске:
@@ -48,13 +55,28 @@ python -c 'from django.core.management.utils import get_random_secret_key; print
 
 В `../.env` заполните `DJANGO_SECRET_KEY` сгенерированным ключом, а `POSTGRES_PASSWORD` паролем роли `my_cloud`. Значения с пробелами или специальными символами заключайте в одинарные кавычки. Для подключения к другой базе измените `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_HOST` и `POSTGRES_PORT`.
 
-Загрузите настройки и запустите Django из `backend/`:
+Загрузите настройки и примените миграции из `backend/`:
 
 ```sh
 set -a
 source ../.env
 set +a
 python manage.py check
+python manage.py migrate
+```
+
+Миграции создают неактивную учётную запись `admin` с неиспользуемым паролем. Для её активации введите пароль в терминале после команды `read`. Ввод скрыт. Минимум 6 символов, одна заглавная латинская буква, одна цифра и один специальный символ.
+
+```sh
+read -r -s MY_CLOUD_ADMIN_PASSWORD
+export MY_CLOUD_ADMIN_PASSWORD
+python manage.py bootstrap_admin
+unset MY_CLOUD_ADMIN_PASSWORD
+```
+
+Повторный запуск `bootstrap_admin` сохраняет установленный пароль. Запустите сервер из того же терминала:
+
+```sh
 python manage.py runserver 127.0.0.1:8000
 ```
 
@@ -64,7 +86,7 @@ python manage.py runserver 127.0.0.1:8000
 curl -i http://127.0.0.1:8000/api/health/
 ```
 
-При доступной базе ответ будет `200` с `{"status":"ok"}`, при недоступной — `503` с `{"status":"unavailable"}`. Первый запуск миграций выполняется после добавления собственной модели пользователя. Уровень логирования задаётся в `DJANGO_LOG_LEVEL`, по умолчанию `INFO`.
+При доступной базе ответ будет `200` с `{"status":"ok"}`, при недоступной — `503` с `{"status":"unavailable"}`. Уровень логирования задаётся в `DJANGO_LOG_LEVEL`, по умолчанию `INFO`.
 
 ### React
 

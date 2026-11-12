@@ -9,7 +9,22 @@ ALLOWED_HOSTS = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-INSTALLED_APPS = ["rest_framework"]
+INSTALLED_APPS = [
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "rest_framework",
+    "accounts",
+]
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+AUTH_USER_MODEL = "accounts.User"
+AUTH_PASSWORD_VALIDATORS = [
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 6},
+    },
+    {"NAME": "accounts.validators.PasswordComplexityValidator"},
+]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
