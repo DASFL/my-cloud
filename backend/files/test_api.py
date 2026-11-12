@@ -2,13 +2,15 @@ from datetime import timedelta
 from pathlib import Path
 from secrets import token_urlsafe
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
+from urllib.parse import unquote
 from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import InMemoryUploadedFile, SimpleUploadedFile
 from django.db import DatabaseError, connection
+from django.http import FileResponse
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -71,6 +73,17 @@ class FileAPITests(APITestCase):
         return client.patch(
             reverse("file-detail", args=[file_id]), data, format="json", **self.csrf_header(client)
         )
+
+    def download(self, file_id, client=None, **headers):
+        client = self.client if client is None else client
+        return client.get(reverse("file-download", args=[file_id]), **headers)
+
+    def read_download(self, response):
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response, FileResponse)
+        content = b"".join(response.streaming_content)
+        self.assertTrue(response.closed)
+        return content
 
     def test_upload_saves_bytes_and_public_metadata(self):
         content = b"\x00report\xff"
@@ -465,3 +478,192 @@ class FileAPITests(APITestCase):
             with self.subTest(changes=changes):
                 self.assertEqual(self.patch_file(stored.pk, changes).status_code, 400)
                 self.assertEqual(StoredFile.objects.values().get(pk=stored.pk), before)
+
+    def test_download_streams_owner_file_without_csrf(self):
+        stored = self.edit_target()
+        del self.client.cookies[settings.CSRF_COOKIE_NAME]
+
+        response = self.download(stored.pk, HTTP_ACCEPT="application/pdf")
+
+        self.assertEqual(self.read_download(response), b"report contents")
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertEqual(response["Content-Disposition"], 'attachment; filename="report.pdf"')
+        self.assertEqual(response["Content-Length"], str(stored.size_bytes))
+        self.assertIn("no-store", response["Cache-Control"])
+
+    def test_download_uses_current_unicode_name_after_rename(self):
+        stored = self.edit_target()
+        name = 'Отчёт за ноябрь + № 7 "финал".txt'
+        self.assertEqual(self.patch_file(stored.pk, {"original_name": name}).status_code, 200)
+
+        response = self.download(stored.pk)
+
+        self.assertEqual(self.read_download(response), b"report contents")
+        disposition, encoded_name = response["Content-Disposition"].split("; filename*=utf-8''")
+        self.assertEqual(disposition, "attachment")
+        self.assertEqual(unquote(encoded_name), name)
+        self.assertEqual(response["Content-Type"], "text/plain")
+
+    def test_download_escapes_ascii_quotes_in_filename(self):
+        stored = self.edit_target()
+        self.assertEqual(
+            self.patch_file(stored.pk, {"original_name": 'Report "final".pdf'}).status_code, 200
+        )
+        response = self.download(stored.pk)
+
+        self.assertEqual(self.read_download(response), b"report contents")
+        self.assertEqual(response["Content-Disposition"], r'attachment; filename="Report \"final\".pdf"')
+
+    def test_download_streams_empty_and_binary_files(self):
+        for content in (b"", bytes(range(256)) * 40):
+            with self.subTest(size=len(content)):
+                uploaded = self.upload(file=SimpleUploadedFile("data.my-cloud-unknown", content))
+                self.assertEqual(uploaded.status_code, 201)
+
+                response = self.download(uploaded.json()["id"])
+
+                self.assertEqual(self.read_download(response), content)
+                self.assertEqual(response["Content-Type"], "application/octet-stream")
+                self.assertEqual(response["Content-Length"], str(len(content)))
+
+    def test_download_updates_only_timestamp_before_stream_is_consumed(self):
+        stored = self.edit_target()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+        path = stored.storage_path
+        first_time = timezone.now()
+        second_time = first_time + timedelta(seconds=1)
+
+        for download_time in (first_time, second_time):
+            with patch("files.views.timezone.now", return_value=download_time):
+                response = self.download(stored.pk)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                StoredFile.objects.values().get(pk=stored.pk),
+                {**before, "last_downloaded_at": download_time},
+            )
+            self.assertEqual(self.read_download(response), b"report contents")
+
+        stored.refresh_from_db()
+        self.assertEqual(stored.storage_path, path)
+        self.assertEqual(path.read_bytes(), b"report contents")
+        listed = self.client.get(self.url).json()[0]
+        self.assertEqual(parse_datetime(listed["last_downloaded_at"]), second_time)
+
+    def test_download_hides_foreign_file_even_from_staff(self):
+        stored = self.edit_target()
+        other_client = self.signed_in_client(self.other)
+        missing = self.download(uuid4(), client=other_client)
+        for is_staff in (False, True):
+            with self.subTest(is_staff=is_staff):
+                get_user_model().objects.filter(pk=self.other.pk).update(is_staff=is_staff)
+                response = self.download(stored.pk, client=other_client)
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json(), missing.json())
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_guest_cannot_download(self):
+        stored = self.edit_target()
+        guest = APIClient(enforce_csrf_checks=True)
+        response = self.download(stored.pk, client=guest)
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(response.json()["detail"])
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_download_rejects_missing_and_invalid_uuid(self):
+        missing = self.download(uuid4())
+        invalid = self.client.get("/api/files/not-a-uuid/download/")
+
+        self.assertEqual(missing.status_code, 404)
+        self.assertTrue(missing.json()["detail"])
+        self.assertEqual(invalid.status_code, 404)
+
+    def test_missing_physical_file_preserves_download_timestamp_and_hides_paths(self):
+        stored = self.edit_target()
+        earlier = timezone.now() - timedelta(days=1)
+        token = token_urlsafe(32)
+        StoredFile.objects.filter(pk=stored.pk).update(last_downloaded_at=earlier, share_token=token)
+        path = stored.storage_path
+        path.unlink()
+
+        response = self.download(stored.pk)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"detail": "Файл недоступен."})
+        for value in (str(path), stored.relative_path, token):
+            self.assertNotIn(value, response.content.decode())
+            self.assertNotIn(value, str(response.headers))
+        stored.refresh_from_db()
+        self.assertEqual(stored.last_downloaded_at, earlier)
+
+    def test_download_does_not_expose_path_or_token_in_success_headers(self):
+        stored = self.edit_target()
+        token = token_urlsafe(32)
+        StoredFile.objects.filter(pk=stored.pk).update(share_token=token)
+        response = self.download(stored.pk)
+
+        self.assertEqual(self.read_download(response), b"report contents")
+        for value in (str(stored.storage_path), stored.relative_path, token):
+            self.assertNotIn(value, str(response.headers))
+
+    def test_download_rejects_file_and_owner_directory_symlinks(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        external_file = outside / path.name
+        external_file.write_bytes(b"outside storage")
+        path.unlink()
+
+        path.symlink_to(external_file)
+        self.assertEqual(self.download(stored.pk).status_code, 404)
+        path.unlink()
+        path.parent.rmdir()
+        path.parent.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.download(stored.pk).status_code, 404)
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_download_does_not_follow_a_symlink_after_path_validation(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        outside = self.root.parent / "outside.txt"
+        outside.write_bytes(b"outside storage")
+        path.unlink()
+        path.symlink_to(outside)
+
+        with patch.object(StoredFile, "storage_path", new_callable=PropertyMock, return_value=path):
+            response = self.download(stored.pk)
+
+        self.assertEqual(response.status_code, 404)
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_download_rejects_corrupted_path_in_database(self):
+        stored = self.edit_target()
+        StoredFile.objects.filter(pk=stored.pk).update(
+            relative_path=f"{self.other.storage_relpath}/{stored.pk.hex}"
+        )
+
+        response = self.download(stored.pk)
+
+        self.assertEqual(response.status_code, 404)
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
+
+    def test_download_closes_file_if_timestamp_cannot_be_saved(self):
+        stored = self.edit_target()
+        with stored.storage_path.open("rb") as source:
+            with (
+                patch("files.views.open_download", return_value=source),
+                patch("django.db.models.query.QuerySet.update", side_effect=DatabaseError("test failure")),
+            ):
+                response = self.download(stored.pk)
+            self.assertTrue(source.closed)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"detail": "Не удалось подготовить скачивание."})
+        stored.refresh_from_db()
+        self.assertIsNone(stored.last_downloaded_at)
