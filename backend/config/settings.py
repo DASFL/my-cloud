@@ -8,6 +8,7 @@ ALLOWED_HOSTS = [
 ]
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
+CSRF_FAILURE_VIEW = "config.views.csrf_failure"
 
 INSTALLED_APPS = [
     "django.contrib.auth",
