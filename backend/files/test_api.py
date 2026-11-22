@@ -1006,3 +1006,144 @@ class FileAPITests(APITestCase):
         self.assertNotIn(path.split("/")[3], logs)
         self.assertIn("Not Found: /api/shared/[redacted]/download/", logs)
         self.assertIn('"GET /api/shared/[redacted]/download/ HTTP/1.1" 200', logs)
+
+    def test_all_file_operations_reject_logged_out_session(self):
+        stored = self.edit_target()
+        path = stored.storage_path
+        session_cookie = self.client.cookies[settings.SESSION_COOKIE_NAME].value
+        response = self.client.post(reverse("logout"), **self.csrf_header(self.client))
+        self.assertEqual(response.status_code, 200)
+        self.client.cookies[settings.SESSION_COOKIE_NAME] = session_cookie
+
+        responses = (
+            self.client.get(self.url), self.upload(), self.download(stored.pk),
+            self.patch_file(stored.pk, {"comment": "Изменить"}),
+            self.delete_file(stored.pk), self.share(stored.pk),
+        )
+        for response in responses:
+            self.assertEqual(response.status_code, 403)
+            self.assertTrue(response.json()["detail"])
+        stored.refresh_from_db()
+        self.assertEqual(stored.comment, "Исходный комментарий")
+        self.assertIsNone(stored.share_token)
+        self.assertEqual(path.read_bytes(), b"report contents")
+        self.assertEqual(StoredFile.objects.count(), 1)
+
+    def test_all_file_mutations_reject_invalid_csrf_and_foreign_origin(self):
+        stored = self.edit_target()
+        before = StoredFile.objects.values().get(pk=stored.pk)
+        for headers in (
+            {}, {"HTTP_X_CSRFTOKEN": "z" * 32},
+            {**self.csrf_header(self.client), "HTTP_ORIGIN": "https://example.invalid"},
+        ):
+            for method, url, data, format in (
+                ("post", self.url, {"file": SimpleUploadedFile("extra.txt", b"extra")}, "multipart"),
+                ("patch", reverse("file-detail", args=[stored.pk]), {"comment": "Изменить"}, "json"),
+                ("delete", reverse("file-detail", args=[stored.pk]), {}, "json"),
+                ("post", reverse("file-share", args=[stored.pk]), {}, "json"),
+            ):
+                with self.subTest(method=method, url=url, headers=headers):
+                    response = getattr(self.client, method)(url, data, format=format, **headers)
+                    self.assertEqual(response.status_code, 403)
+                    self.assertTrue(response.json()["detail"])
+        self.assertEqual(StoredFile.objects.values().get(pk=stored.pk), before)
+        self.assertEqual(self.saved_paths(), [self.root / stored.relative_path])
+
+    def test_private_storage_is_not_served_at_direct_urls(self):
+        stored = self.edit_target()
+        guest = APIClient()
+        for prefix in ("/media/", "/private_storage/", "/static/", "/api/files/"):
+            for client in (self.client, guest):
+                response = client.get(prefix + stored.relative_path)
+                self.assertEqual(response.status_code, 404)
+                self.assertNotIn(b"report contents", response.content)
+        self.assertTrue(stored.storage_path.is_file())
+
+    def test_upload_rejects_directory_replacement_after_path_validation(self):
+        self.root.mkdir()
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        owner_directory = self.root.resolve() / self.owner.storage_relpath
+        original_mkdir = Path.mkdir
+
+        def replace_owner_directory(directory, *args, **kwargs):
+            original_mkdir(directory, *args, **kwargs)
+            if directory == owner_directory:
+                directory.rmdir()
+                directory.symlink_to(outside, target_is_directory=True)
+
+        with patch.object(Path, "mkdir", replace_owner_directory):
+            response = self.upload()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(StoredFile.objects.exists())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def registered_client(self, username):
+        client = APIClient(enforce_csrf_checks=True)
+        client.get(reverse("csrf"))
+        response = client.post(
+            reverse("register"), {
+                "username": username, "password": self.password,
+                "full_name": "Тестовый пользователь", "email": f"{username}@example.invalid",
+            }, format="json", **self.csrf_header(client),
+        )
+        self.assertEqual(response.status_code, 201)
+        return self.signed_in_client(get_user_model().objects.get(pk=response.json()["id"]))
+
+    def test_registered_user_full_private_file_lifecycle(self):
+        client = self.registered_client("LifecycleA")
+        uploaded = self.upload(b"lifecycle bytes", client=client)
+        self.assertEqual(uploaded.status_code, 201)
+        stored = StoredFile.objects.get(pk=uploaded.json()["id"])
+        path = stored.storage_path
+        renamed = self.patch_file(stored.pk, {"original_name": "Новый отчёт.pdf"}, client=client)
+        self.assertEqual(renamed.status_code, 200)
+        response = self.download(stored.pk, client=client)
+        self.assertEqual(self.read_download(response), b"lifecycle bytes")
+        self.assertEqual(unquote(response["Content-Disposition"].split("filename*=utf-8''")[1]), "Новый отчёт.pdf")
+        self.assertEqual(self.delete_file(stored.pk, client=client).status_code, 204)
+        self.assertEqual(client.get(self.url).json(), [])
+        self.assertFalse(path.exists())
+
+    def test_registered_user_public_link_lifecycle(self):
+        client = self.registered_client("LifecycleB")
+        uploaded = self.upload(b"public lifecycle", client=client)
+        self.assertEqual(uploaded.status_code, 201)
+        stored = StoredFile.objects.get(pk=uploaded.json()["id"])
+        path = stored.storage_path
+        response = self.share(stored.pk, client=client)
+        self.assertEqual(response.status_code, 200)
+        shared_path = urlsplit(response.json()["url"]).path
+        guest = APIClient(enforce_csrf_checks=True)
+        self.assertEqual(self.read_download(guest.get(shared_path)), b"public lifecycle")
+        self.assertFalse(guest.cookies)
+        self.assertEqual(self.delete_file(stored.pk, client=client).status_code, 204)
+        self.assertEqual(guest.get(shared_path).status_code, 404)
+        self.assertFalse(path.exists())
+
+    def test_two_registered_users_remain_isolated_through_all_file_operations(self):
+        first = self.registered_client("IsolationA")
+        second = self.registered_client("IsolationB")
+        first_upload = self.upload(b"first owner", client=first)
+        second_upload = self.upload(b"second owner", client=second)
+        self.assertEqual(first_upload.status_code, 201)
+        self.assertEqual(second_upload.status_code, 201)
+        first_file = StoredFile.objects.get(pk=first_upload.json()["id"])
+        second_file = StoredFile.objects.get(pk=second_upload.json()["id"])
+        self.assertNotEqual(first_file.relative_path, second_file.relative_path)
+        for client, own, foreign, content in (
+            (first, first_file, second_file, b"first owner"),
+            (second, second_file, first_file, b"second owner"),
+        ):
+            listed = client.get(self.url, {"owner": foreign.owner_id, "owner_id": foreign.owner_id})
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual([item["id"] for item in listed.json()], [str(own.pk)])
+            for target in (foreign.pk, uuid4()):
+                self.assertEqual(self.download(target, client=client).status_code, 404)
+                self.assertEqual(self.patch_file(target, {"comment": "Чужой"}, client=client).status_code, 404)
+                self.assertEqual(self.delete_file(target, client=client).status_code, 404)
+                self.assertEqual(self.share(target, client=client).status_code, 404)
+            self.assertEqual(self.read_download(self.download(own.pk, client=client)), content)
+        self.assertEqual(first_file.storage_path.read_bytes(), b"first owner")
+        self.assertEqual(second_file.storage_path.read_bytes(), b"second owner")
