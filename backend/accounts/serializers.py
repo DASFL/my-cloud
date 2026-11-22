@@ -19,6 +19,33 @@ class SessionUserSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class AdminUserSerializer(SessionUserSerializer):
+    files_count = serializers.IntegerField(read_only=True)
+    total_size_bytes = serializers.IntegerField(read_only=True)
+
+    class Meta(SessionUserSerializer.Meta):
+        fields = SessionUserSerializer.Meta.fields + ("files_count", "total_size_bytes")
+        read_only_fields = fields
+
+
+class AdminRoleSerializer(serializers.Serializer):
+    is_staff = serializers.BooleanField()
+
+    def validate_is_staff(self, value):
+        if not isinstance(self.initial_data["is_staff"], bool):
+            raise serializers.ValidationError("Передайте true или false.")
+        return value
+
+    def validate(self, attrs):
+        unexpected = {
+            name: ["Это поле нельзя изменять."]
+            for name in self.initial_data if name != "is_staff"
+        }
+        if unexpected:
+            raise serializers.ValidationError(unexpected)
+        return attrs
+
+
 class RegistrationSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, trim_whitespace=False)
 
