@@ -1,9 +1,12 @@
 import logging
 import os
+import re
 import stat
 from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from secrets import token_urlsafe
 
+from django.conf import settings
 from django.db import DatabaseError, IntegrityError, transaction
 from psycopg.errors import UniqueViolation
 
@@ -57,6 +60,48 @@ def _open_owner_directory(path):
         owner_fd = os.open(path.parent.name, directory_flags, dir_fd=root_fd)
         directories.callback(os.close, owner_fd)
         yield owner_fd
+
+
+@contextmanager
+def open_storage_directory(storage_relpath):
+    if not re.fullmatch(r"[0-9a-f]{32}", storage_relpath):
+        raise ValueError("Некорректный каталог хранилища.")
+    path = Path(settings.FILE_STORAGE_ROOT).resolve() / storage_relpath / "unused"
+    with ExitStack() as directories:
+        try:
+            owner_fd = directories.enter_context(_open_owner_directory(path))
+        except FileNotFoundError:
+            owner_fd = None
+        yield owner_fd
+
+
+def storage_file_names(owner_fd):
+    if owner_fd is None:
+        return []
+    names = os.listdir(owner_fd)
+    for name in names:
+        if not re.fullmatch(r"[0-9a-f]{32}", name):
+            raise ValueError("В каталоге есть неизвестные записи.")
+        try:
+            mode = os.stat(name, dir_fd=owner_fd, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError("Очищать можно только обычные файлы.")
+    return names
+
+
+def remove_storage_files(owner_fd, names):
+    for name in names:
+        if not re.fullmatch(r"[0-9a-f]{32}", name):
+            raise ValueError("Некорректное имя физического файла.")
+        try:
+            mode = os.stat(name, dir_fd=owner_fd, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                raise ValueError("Очищать можно только обычные файлы.")
+            os.unlink(name, dir_fd=owner_fd)
+        except FileNotFoundError:
+            pass
 
 
 def open_download(stored):

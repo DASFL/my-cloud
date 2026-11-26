@@ -229,10 +229,7 @@ class AdminUserTests(APITestCase):
         self.assertFalse(self.admin.is_superuser)
         self.assertEqual(self.client.get(self.url).status_code, 200)
 
-    def test_admin_api_does_not_implement_deletion_or_file_access(self):
-        response = self.client.delete(reverse("admin-user-detail", args=[self.member.pk]), **self.csrf(self.client))
-        self.assertEqual(response.status_code, 405)
-        self.assertTrue(User.objects.filter(pk=self.member.pk).exists())
+    def test_admin_api_does_not_grant_file_access(self):
         stored = self.file_record(self.member, 10)
         response = self.client.get(reverse("file-download", args=[stored.pk]))
         self.assertEqual(response.status_code, 404)
