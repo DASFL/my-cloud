@@ -41,23 +41,28 @@ def public_origin():
     return origin.removesuffix("/")
 
 
+class FileOwnerMixin:
+    def get_owner(self, request):
+        return request.user
+
+
 @method_decorator(never_cache, name="dispatch")
-class FileListView(APIView):
+class FileListView(FileOwnerMixin, APIView):
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
     renderer_classes = [JSONRenderer]
 
-    def get(self, request):
-        files = StoredFile.objects.filter(owner=request.user).order_by("-created_at", "-id")
+    def get(self, request, **kwargs):
+        files = StoredFile.objects.filter(owner=self.get_owner(request)).order_by("-created_at", "-id")
         return Response(StoredFileSerializer(files, many=True).data)
 
-    def post(self, request):
+    def post(self, request, **kwargs):
         serializer = FileUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
             stored = save_upload(
-                request.user, serializer.validated_data["file"], serializer.validated_data["comment"]
+                self.get_owner(request), serializer.validated_data["file"], serializer.validated_data["comment"]
             )
         except (OSError, DatabaseError, ValueError, RuntimeError):
             logger.error("Не удалось сохранить загруженный файл.")
@@ -69,20 +74,20 @@ class FileListView(APIView):
 
 
 @method_decorator(never_cache, name="dispatch")
-class FileDetailView(APIView):
+class FileDetailView(FileOwnerMixin, APIView):
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     parser_classes = [JSONParser]
     renderer_classes = [JSONRenderer]
 
-    def patch(self, request, file_id):
-        stored = get_object_or_404(StoredFile, pk=file_id, owner=request.user)
+    def patch(self, request, file_id, **kwargs):
+        stored = get_object_or_404(StoredFile, pk=file_id, owner=self.get_owner(request))
         serializer = StoredFileUpdateSerializer(stored, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(StoredFileSerializer(stored).data)
 
-    def delete(self, request, file_id):
+    def delete(self, request, file_id, **kwargs):
         if request.data:
             return Response(
                 {"detail": "DELETE не принимает тело запроса."},
@@ -90,7 +95,7 @@ class FileDetailView(APIView):
             )
 
         try:
-            delete_stored_file(request.user, file_id)
+            delete_stored_file(self.get_owner(request), file_id)
         except StoredFile.DoesNotExist:
             raise NotFound("Файл не найден.") from None
         except (DatabaseError, OSError, ValueError, RuntimeError):
@@ -102,13 +107,13 @@ class FileDetailView(APIView):
 
 
 @method_decorator(never_cache, name="dispatch")
-class FileShareView(APIView):
+class FileShareView(FileOwnerMixin, APIView):
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     renderer_classes = [JSONRenderer]
 
-    def post(self, request, file_id):
-        owned_files = StoredFile.objects.filter(owner=request.user)
+    def post(self, request, file_id, **kwargs):
+        owned_files = StoredFile.objects.filter(owner=self.get_owner(request))
         try:
             origin = public_origin()
         except (ValidationError, ValueError):
@@ -161,12 +166,12 @@ class DownloadView(APIView):
         return super().perform_content_negotiation(request, force=True)
 
 
-class FileDownloadView(DownloadView):
+class FileDownloadView(FileOwnerMixin, DownloadView):
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, file_id):
-        return download_response(StoredFile.objects.filter(owner=request.user, pk=file_id))
+    def get(self, request, file_id, **kwargs):
+        return download_response(StoredFile.objects.filter(owner=self.get_owner(request), pk=file_id))
 
 
 class SharedDownloadView(DownloadView):
